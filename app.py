@@ -368,6 +368,98 @@ elif tab == "Warnings":
                         st.rerun()
                     st.button("Open flight", key="o" + fx["key"], on_click=open_flight, args=(i["idx"],),
                               use_container_width=True)
+# ---------- CONTROL ----------
+elif tab == "Control":
+    @st.cache_data
+    def load_daily():
+        d = pd.read_csv("data/daily_late.csv", parse_dates=["flight_date"])
+        d["p"] = d["late"] / d["flights"]
+        return d
+
+    def sigma_of(p):
+        return NormalDist().inv_cdf(1 - p) + 1.5 if 0 < p < 1 else float("nan")
+
+    daily = load_daily()
+    hist = daily[daily["flight_date"] < "2026-01-03"].copy()        # only days before the replay day
+    landed = flights[flights["landed"]]
+
+    c1, c2 = st.columns([3, 2])
+    chart_type = c1.radio("Chart", ["Standard p-chart", "Laney p′ chart"], horizontal=True)
+    window = c2.radio("Window", ["Last 30 days", "All days (May 2025 on)"], horizontal=True)
+    view = hist.tail(30).copy() if window == "Last 30 days" else hist.copy()
+
+    # control limits (centre line = average late share of the days shown)
+    p_bar = view["late"].sum() / view["flights"].sum()
+    view["s"] = (p_bar * (1 - p_bar) / view["flights"]) ** 0.5
+    if chart_type == "Laney p′ chart":
+        z = (view["p"] - p_bar) / view["s"]
+        sigma_z = z.diff().abs().mean() / 1.128
+        view["s"] = view["s"] * sigma_z
+    view["ucl"] = p_bar + 3 * view["s"]
+    view["lcl"] = (p_bar - 3 * view["s"]).clip(lower=0)
+    view["out"] = (view["p"] > view["ucl"]) | (view["p"] < view["lcl"])
+
+    # KPIs
+    sent_codes = {e["warning_code"] for e in st.session_state.log if e["action"] == "Sent"}
+    done_codes = {e["warning_code"] for e in st.session_state.log if e["action"] == "Fix done"}
+    jan = daily[(daily["flight_date"] >= "2026-01-01") & (daily["flight_date"] < "2026-01-03")]
+    jan_late = jan["late"].sum() + landed["delayed_15"].sum()
+    jan_n = jan["flights"].sum() + len(landed)
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1.container(border=True):
+        st.metric("Days out of limits", f"{int(view['out'].sum())} of {len(view)}")
+        st.caption(chart_type)
+    with k2.container(border=True):
+        rate = f"{len(done_codes & sent_codes) / len(sent_codes):.0%}" if sent_codes else "n/a"
+        st.metric("Fix completion rate", rate)
+        st.caption(f"{len(done_codes & sent_codes)} of {len(sent_codes)} warnings sent got a fix done")
+    with k3.container(border=True):
+        st.metric("Sigma this month", f"{sigma_of(jan_late / jan_n):.2f} σ")
+        st.caption("January so far (incl. today) · baseline 2.24 σ")
+    with k4.container(border=True):
+        st.metric("Model AUC", "0.770")
+        st.caption("Test Jan–Feb 2026 · target 0.75 or above · retrain if it drops")
+
+    # p-chart (dates as labels, so missing days take no space)
+    view["lbl"] = view["flight_date"].dt.strftime("%d %b %y")
+    with st.container(border=True):
+        st.markdown(f"**{chart_type}: daily share of late arrivals** (red = outside the limits)")
+        fig = go.Figure()
+        fig.add_scatter(x=view["lbl"], y=view["ucl"], name="UCL", line=dict(color=RED, dash="dash", shape="hv"))
+        fig.add_scatter(x=view["lbl"], y=view["lcl"], name="LCL", line=dict(color=RED, dash="dash", shape="hv"))
+        fig.add_hline(y=p_bar, line_color=MUTED, annotation_text=f"Mean {p_bar:.1%}")
+        fig.add_scatter(x=view["lbl"], y=view["p"], mode="lines+markers", name="Daily late share",
+                        line=dict(color=MUTED, width=1),
+                        marker=dict(size=8, color=[RED if o else NAVY for o in view["out"]]))
+        if len(landed):
+            fig.add_scatter(x=["03 Jan 26 (today)"], y=[landed["delayed_15"].mean()], mode="markers",
+                            name="Today so far", marker=dict(size=12, color="white", line=dict(color=NAVY, width=2)))
+        fig.update_layout(height=380, margin=dict(l=10, r=10, t=10, b=10), yaxis_tickformat=".0%",
+                          xaxis=dict(type="category", nticks=12), legend=dict(orientation="h", y=-0.2))
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Days with no data in the source files are skipped. Standard limits assume days differ only by chance, "
+                   "so with ~600 flights a day they are very tight. Laney p′ widens them for normal day-to-day swings, "
+                   "so only truly unusual days stand out.")
+
+    g1, g2 = st.columns(2)
+    with g1.container(border=True):
+        st.markdown("**Sigma level by month**")
+        m = hist.groupby(hist["flight_date"].dt.to_period("M"))[["late", "flights"]].sum()
+        m.loc[pd.Period("2026-01", "M")] = [jan_late, jan_n]
+        m["sigma"] = (m["late"] / m["flights"]).apply(sigma_of)
+        fig2 = go.Figure(go.Bar(x=m.index.strftime("%b %y"), y=m["sigma"], marker_color=NAVY))
+        fig2.add_hline(y=2.24, line_dash="dash", line_color=RED, annotation_text="Baseline 2.24 σ")
+        fig2.update_layout(height=280, margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig2, use_container_width=True)
+    with g2.container(border=True):
+        st.markdown("**Control plan**")
+        st.dataframe(pd.DataFrame({
+            "What we watch": ["Daily late share", "Fix completion rate", "Sigma level", "Model AUC"],
+            "Target": ["Inside the limits", "90% or above", "Above 2.24 σ", "0.75 or above"],
+            "Owner": ["Ops control manager", "Shift lead", "Ops control manager", "Analytics team"],
+            "If it breaks": ["Find the special cause", "Chase overdue owners", "Review the fix rules", "Retrain the model"],
+        }), hide_index=True, use_container_width=True)
 else:
     st.info(f"{tab} tab: coming next.")
 
