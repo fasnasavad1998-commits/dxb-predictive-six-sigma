@@ -1,0 +1,21 @@
+driver,reason,fix,owner,actionable
+knockon_dep_delay_min,Knock-on late,Hold stand and ready ground crew,Airport ops centre,1
+knockon_missing,Knock-on late,Hold stand and ready ground crew,Airport ops centre,1
+rotation_gap_h,Short turnaround,Add time buffer or standby crew,Airline control centre,1
+route_late_rate_7d,Late-running route,Alert origin station to push on-time departure,Origin station (airline),1
+route_rate_missing,Late-running route,Alert origin station to push on-time departure,Origin station (airline),1
+origin_region,Late-running route,Alert origin station to push on-time departure,Origin station (airline),1
+hourly_arrivals,Busy hour,"Pre-allocate stand, add ground staff",Ground handler,1
+hour,Busy hour,"Pre-allocate stand, add ground staff",Ground handler,1
+wind_kt,Weather,Turn on bad-weather plan,ATC / weather desk,1
+vis_km,Weather,Turn on bad-weather plan,ATC / weather desk,1
+fog_dust,Weather,Turn on bad-weather plan,ATC / weather desk,1
+severe_weather,Weather,Turn on bad-weather plan,ATC / weather desk,1
+airline_group,Airline pattern,Flag to the airline's on-time team,Airline control centre,1
+season,Peak period,Check peak-day staffing,Airport ops centre,1
+day_of_week,Peak period,Check peak-day staffing,Airport ops centre,1
+temp_c,Peak period,Check peak-day staffing,Airport ops centre,1
+aircraftterminal,Terminal load,Check stand availability at the terminal,Airport ops centre,1
+body_type,Flight type,Monitor only,None,0
+is_codeshare,Flight type,Monitor only,None,0
+has_stopover,Flight type,Monitor only,None,0
