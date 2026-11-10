@@ -291,6 +291,83 @@ elif tab == "Flight detail":
                     send_warning(x, f["flightnumber"])
                     st.rerun()
 
+# ---------- WARNINGS ----------
+elif tab == "Warnings":
+    WINDOW = 60          # warning opens when a high-risk flight is this close (min)
+    OVERDUE = 15         # sent but not acknowledged after this many min
+
+    def open_flight(idx):
+        st.session_state.sel = idx
+        st.session_state.auto = False
+        st.session_state.tab = "Flight detail"
+
+    def due(m):
+        return f"{int(m)} min to go" if m >= 0 else f"{int(-m)} min overdue"
+
+    sent_at = {}
+    for e in st.session_state.log:
+        if e["action"] == "Sent" and e["warning_code"] not in sent_at:
+            h, m = e["time"].split(":")
+            sent_at[e["warning_code"]] = int(h) * 60 + int(m)
+
+    items = []
+    for idx, row in to_come[to_come["high"]].iterrows():
+        for fx in row["fixes"]:
+            status = st.session_state.warn.get(fx["key"])
+            if st.session_state.done.get(fx["key"]):
+                continue
+            if row["mins_to"] > WINDOW and not status:
+                continue
+            status = status or "New"
+            if status == "Sent" and now - sent_at.get(fx["code"], now) > OVERDUE:
+                status = "Overdue"
+            items.append({"idx": idx, "row": row, "fx": fx, "status": status})
+
+    counts = pd.Series([i["status"] for i in items]).value_counts()
+    k = st.columns(4)
+    for col, name in zip(k, ["New", "Sent", "Acknowledged", "Overdue"]):
+        with col.container(border=True):
+            st.metric(name, int(counts.get(name, 0)))
+    st.caption(f"A warning opens when a flight is high risk, a fix is not in place and it lands within {WINDOW} min. "
+               f"Overdue = sent but not acknowledged within {OVERDUE} min. Mark fix done closes it.")
+
+    w1, w2 = st.columns([4, 1])
+    w1.markdown("**Open warnings by owner**")
+    log = pd.DataFrame(st.session_state.log)
+    w2.download_button(f"Download log (CSV) · {len(log)} entries",
+                       log.to_csv(index=False) if len(log) else "time,warning_code,flight,owner,fix,action\n",
+                       "warning_log_3jan2026.csv", "text/csv", use_container_width=True)
+
+    owners = list(rules.loc[rules["actionable"] == 1, "owner"].unique())
+    cols = st.columns(len(owners))
+    for col, owner in zip(cols, owners):
+        mine = sorted([i for i in items if i["fx"]["owner"] == owner],
+                      key=lambda i: (i["row"]["mins_to"] < 0, abs(i["row"]["mins_to"])))
+        with col.container(border=True):
+            st.markdown(f"**{owner}**  \n{len(mine)} open")
+            if not mine:
+                st.caption("All clear")
+            for i in mine:
+                row, fx = i["row"], i["fx"]
+                with st.container(border=True):
+                    st.caption(fx["code"])
+                    st.markdown(f"**{row['flightnumber']}** · scheduled {row['eta_txt']} · **{due(row['mins_to'])}**")
+                    st.write(fx["fix"])
+                    st.write(f"Status: **{i['status']}**")
+                    b1, b2 = st.columns(2)
+                    if i["status"] == "New" and b1.button("Send", key="s" + fx["key"], use_container_width=True):
+                        send_warning(fx, row["flightnumber"])
+                        st.rerun()
+                    if i["status"] in ("Sent", "Overdue") and b1.button("Acknowledge", key="a" + fx["key"], use_container_width=True):
+                        st.session_state.warn[fx["key"]] = "Acknowledged"
+                        record(fx, row["flightnumber"], "Acknowledged")
+                        st.rerun()
+                    if b2.button("Mark fix done", key="d" + fx["key"], use_container_width=True):
+                        st.session_state.done[fx["key"]] = True
+                        record(fx, row["flightnumber"], "Fix done")
+                        st.rerun()
+                    st.button("Open flight", key="o" + fx["key"], on_click=open_flight, args=(i["idx"],),
+                              use_container_width=True)
 else:
     st.info(f"{tab} tab: coming next.")
 
