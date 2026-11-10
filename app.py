@@ -19,15 +19,14 @@ def load_data():
     day_start = pd.Timestamp("2026-01-03")
     df["act_min"] = (actual - day_start).dt.total_seconds() / 60
     df["eta_txt"] = sched.dt.strftime("%H:%M")
+    df["act_txt"] = actual.dt.strftime("%H:%M")
     df["risk_pct"] = (df["p_xgb"] * 100).round().astype(int)
     df["high"] = df["p_xgb"] >= CUTOFF
-    # add SHAP values up into the reasons from the rules table
     for reason in rules["reason"].unique():
         drivers = rules.loc[rules["reason"] == reason, "driver"]
         df["r_" + reason] = df[["shap_" + d for d in drivers]].sum(axis=1)
     reason_cols = ["r_" + r for r in rules["reason"].unique()]
     df["main_reason"] = df[reason_cols].idxmax(axis=1).str[2:]
-    # suggested fixes = top 2 actionable reasons that push the risk up
     action = (rules[rules["actionable"] == 1].drop_duplicates("reason")
               .set_index("reason")[["fix", "owner"]].to_dict("index"))
     def fixes_for(row):
@@ -43,9 +42,11 @@ def load_data():
 
 flights, rules = load_data()
 flights = flights.copy()
+REASONS = list(rules["reason"].unique())
 
 # ---------- Memory between clicks ----------
-for k, v in {"now": 10 * 60, "tab": "Today", "sel": None, "done": {}, "warn": {}, "log": []}.items():
+for k, v in {"now": 10 * 60, "tab": "Today", "sel": None, "auto": True,
+             "done": {}, "warn": {}, "log": []}.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -55,11 +56,26 @@ def fmt(m):
 def go_to(tab_name):
     st.session_state.tab = tab_name
 
+def tab_changed():
+    if st.session_state.tab == "Flight detail":      # opened from the tab bar -> auto-pick
+        st.session_state.sel = None
+        st.session_state.auto = True
+
 def open_from(table_key, ids_key):
     rows = st.session_state[table_key].selection.rows
     if rows:
         st.session_state.sel = st.session_state[ids_key][rows[0]]
+        st.session_state.auto = False
         st.session_state.tab = "Flight detail"
+
+def record(fx, flight_no, action):
+    st.session_state.log.append({"time": fmt(st.session_state.now), "warning_code": fx["code"], "flight": flight_no,
+                                 "owner": fx["owner"], "fix": fx["fix"], "action": action})
+
+def send_warning(fx, flight_no):
+    if not st.session_state.done.get(fx["key"]) and not st.session_state.warn.get(fx["key"]):
+        st.session_state.warn[fx["key"]] = "Sent"
+        record(fx, flight_no, "Sent")
 
 now = st.session_state.now
 flights["landed"] = flights["act_min"] <= now
@@ -73,7 +89,11 @@ def fix_status(row):
     all_done = all(st.session_state.done.get(f["key"]) for f in row["fixes"])
     return "Fix in place" if all_done else "Fix missing"
 
+def actioned(row):
+    return all(st.session_state.done.get(f["key"]) or st.session_state.warn.get(f["key"]) for f in row["fixes"])
+
 flights["fix_status"] = flights.apply(fix_status, axis=1)
+flights["actioned"] = flights.apply(actioned, axis=1)
 to_come = flights[~flights["landed"]]
 
 SHOW_COLS = {"flightnumber": "Flight", "origin_iata": "From", "eta_txt": "ETA",
@@ -96,7 +116,7 @@ with left:
         st.rerun()
 with right:
     st.radio("Tab", ["Today", "Flights", "Flight detail", "Warnings", "Control", "Try a flight"],
-             key="tab", horizontal=True, label_visibility="collapsed")
+             key="tab", horizontal=True, label_visibility="collapsed", on_change=tab_changed)
 st.divider()
 tab = st.session_state.tab
 
@@ -177,6 +197,99 @@ elif tab == "Flights":
     st.session_state.flight_ids = view.index.tolist()
     st.dataframe(table, hide_index=True, use_container_width=True, height=560, key="flight_table",
                  on_select=lambda: open_from("flight_table", "flight_ids"), selection_mode="single-row")
+
+# ---------- FLIGHT DETAIL ----------
+elif tab == "Flight detail":
+    hi_up = to_come[to_come["high"]]
+    n_actioned = int(hi_up["actioned"].sum())
+
+    # pick the flight: clicked one, or the most urgent unactioned one (then keep it while the clock runs)
+    if st.session_state.sel is None:
+        pending = hi_up[~hi_up["actioned"]].sort_values("p_xgb", ascending=False)
+        pool = pending if len(pending) else to_come.sort_values("p_xgb", ascending=False)
+        st.session_state.sel = pool.index[0] if len(pool) else flights.index[0]
+        st.session_state.auto = len(pending) > 0
+    f = flights.loc[st.session_state.sel]
+
+    t1, t2, t3 = st.columns([2, 2, 1])
+    with t1.container(border=True):
+        st.metric("Pending action", f"{len(hi_up) - n_actioned} flights")
+        st.caption("High risk, a fix not in place and no warning sent")
+    with t2.container(border=True):
+        st.metric("Actioned", f"{n_actioned} flights")
+        st.caption("Every fix in place or warned")
+    t3.button("Back to flight list", on_click=go_to, args=("Flights",), use_container_width=True)
+
+    if st.session_state.auto:
+        st.info("Auto-picked the most urgent flight: highest risk with a fix still missing. "
+                "It stays here while you work. Click the Flight detail tab again for the next one.")
+
+    a1, a2 = st.columns([3, 1])
+    with a1.container(border=True):
+        st.markdown(f"#### {f['flightnumber']} from {f['originname']} ({f['origin_iata']})")
+        when = f"landed {f['act_txt']}" if f["landed"] else f"in {int(f['mins_to'])} min"
+        st.write(f"{f['airlinename']} · aircraft {f['aircraft_iata']} ({f['aircraftregistration']}) · "
+                 f"terminal {f['aircraftterminal']} · scheduled {f['eta_txt']} ({when})")
+        if f["landed"]:
+            outcome = "late" if f["delayed_15"] else "on time"
+            right_call = (f["high"] and f["delayed_15"]) or (not f["high"] and not f["delayed_15"])
+            st.write(f"**Actual result:** {outcome} ({f['arr_delay_min']:.0f} min). "
+                     f"Prediction was {'correct' if right_call else 'wrong'}.")
+    with a2.container(border=True):
+        band = "High" if f["p_xgb"] >= 0.70 else ("Medium" if f["high"] else "Low")
+        st.metric("Risk score", f"{f['risk_pct']}%")
+        st.caption(f"{band} risk · XGBoost · cut-off {CUTOFF:.0%}")
+
+    b1, b2 = st.columns([2, 1])
+    with b1.container(border=True):
+        st.markdown("**Why is it risky?** Red pushes towards late, blue towards on time.")
+        vals = pd.Series({r: f["r_" + r] for r in REASONS})
+        vals = vals.reindex(vals.abs().sort_values(ascending=False).index)[:6][::-1]
+        fig = go.Figure(go.Bar(x=vals.values, y=vals.index, orientation="h",
+                               marker_color=[RED if v > 0 else MUTED for v in vals.values]))
+        fig.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="SHAP (log-odds)")
+        st.plotly_chart(fig, use_container_width=True)
+    with b2.container(border=True):
+        st.markdown("**Key facts**")
+        st.write(f"Inbound plane departure delay: **{f['knockon_dep_delay_min']:.0f} min**")
+        st.write(f"Rotation gap: **{f['rotation_gap_h']:.1f} h**")
+        st.write(f"Route late rate (7 days): **{f['route_late_rate_7d']:.0%}**")
+        st.write(f"Arrivals in that hour: **{f['hourly_arrivals']:.0f}**")
+        st.write(f"Wind **{f['wind_kt']:.0f} kt** · visibility **{f['vis_km']:.0f} km** · {f['temp_c']:.0f}°C")
+
+    with st.container(border=True):
+        h1, h2 = st.columns([4, 1])
+        h1.markdown("**Suggested fixes**")
+        fixes = f["fixes"]
+        open_fixes = [x for x in fixes if not st.session_state.done.get(x["key"])]
+        if not f["high"]:
+            st.write("Below the cut-off. No action needed.")
+        elif f["landed"]:
+            st.write("Flight has landed. Fixes no longer needed.")
+        else:
+            all_sent = open_fixes and all(st.session_state.warn.get(x["key"]) for x in open_fixes)
+            if not open_fixes:
+                h2.button("All fixes in place", disabled=True, use_container_width=True)
+            elif all_sent:
+                h2.button("Warnings sent", disabled=True, use_container_width=True)
+            elif h2.button("Send all warnings", type="primary", use_container_width=True):
+                for x in open_fixes:
+                    send_warning(x, f["flightnumber"])
+                st.rerun()
+            for x in fixes:
+                done = st.session_state.done.get(x["key"])
+                status = st.session_state.warn.get(x["key"])
+                r1, r2, r3, r4 = st.columns([4, 2, 1.3, 1.3])
+                r1.write(f"{x['fix']}  \n`{x['code']}` · reason: {x['reason']}")
+                r2.write(x["owner"])
+                r3.write("In place" if done else "Not in place")
+                if done:
+                    r4.button("Not needed", key="b" + x["key"], disabled=True, use_container_width=True)
+                elif status:
+                    r4.button(f"Warning {status.lower()}", key="b" + x["key"], disabled=True, use_container_width=True)
+                elif r4.button("Send warning", key="b" + x["key"], use_container_width=True):
+                    send_warning(x, f["flightnumber"])
+                    st.rerun()
 
 else:
     st.info(f"{tab} tab: coming next.")
