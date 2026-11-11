@@ -246,6 +246,8 @@ header[data-testid="stHeader"], #MainMenu, footer {{ visibility: hidden; height:
 [class*="st-key-arrow_"] button p {{ color: {NAVY} !important; font-size: 28px !important; line-height: 1 !important; }}
 [class*="st-key-arrow_"] button:hover p {{ color: {PURPLE} !important; }}
 [class*="st-key-plan_"] {{ background: #FFFFFF; border-radius: 12px; padding: 10px 16px; }}
+/* login form */
+[data-testid="stForm"] {{ background: #FFFFFF; border: none; border-radius: 12px; padding: 20px; }}
 /* every radio becomes pills */
 div[role="radiogroup"] {{ gap: 6px; flex-wrap: wrap; }}
 div[role="radiogroup"] label {{ background: #FFFFFF; border: 1px solid #D9DEE5; border-radius: 999px; padding: 6px 14px; margin: 0; cursor: pointer; }}
@@ -265,13 +267,54 @@ div[role="radiogroup"] label[data-selected="true"] p, div[role="radiogroup"] lab
 </style>
 """, unsafe_allow_html=True)
 
+# ---------- Login ----------
+# Usernames and passwords live in .streamlit/secrets.toml (never on GitHub), e.g.
+# [users.ops_manager]
+# password = "..."
+# name = "Ops Control Manager"
+USERS = st.secrets.get("users", {})
+if "auth" not in st.session_state:
+    st.session_state.auth = False
+    st.session_state.who = ""
+
+
+def sign_out():
+    st.session_state.auth = False
+    st.session_state.who = ""
+
+
+if not st.session_state.auth:
+    _, mid, _ = st.columns([1, 1.2, 1])
+    with mid:
+        st.markdown(f"""
+<div style="background:{NAVY};border-radius:12px;padding:18px 22px;margin:40px 0 14px 0">
+  <div style="color:#FFFFFF;font-size:22px;font-weight:700">DXB Predictive Six Sigma Dashboard</div>
+  <div style="color:#C9CCF5;font-size:14px">Arrival delay prediction for the Operations Control Manager</div>
+</div>""", unsafe_allow_html=True)
+        with st.form("login"):
+            st.markdown("**Sign in**")
+            user = st.text_input("Username")
+            pwd = st.text_input("Password", type="password")
+            if st.form_submit_button("Sign in", type="primary", use_container_width=True):
+                u = user.strip()
+                if not USERS:
+                    st.error("No users are set up yet. Add them to .streamlit/secrets.toml.")
+                elif u in USERS and pwd == USERS[u]["password"]:
+                    st.session_state.auth = True
+                    st.session_state.who = USERS[u].get("name", u)
+                    st.rerun()
+                else:
+                    st.error("Wrong username or password.")
+        st.caption("Student prototype (BUS922). Not affiliated with or endorsed by Dubai Airports.")
+    st.stop()
+
 # ---------- Header ----------
 st.markdown(f"""
 <div style="background:{NAVY};border-radius:12px;padding:16px 22px;display:flex;flex-wrap:wrap;
             justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px">
   <div>
     <div style="color:#FFFFFF;font-size:22px;font-weight:700">DXB Predictive Six Sigma Dashboard</div>
-    <div style="color:#C9CCF5;font-size:13px">Ops Control Manager · Replay day: 3 Jan 2026 (stress-test day)</div>
+    <div style="color:#C9CCF5;font-size:13px">Signed in as {st.session_state.who} · Replay day: 3 Jan 2026 (stress-test day)</div>
   </div>
   <div style="display:flex;align-items:center;gap:10px">
     <span style="background:{RED};color:#FFFFFF;font-size:11px;font-weight:700;border-radius:999px;padding:3px 10px">REPLAY</span>
@@ -282,7 +325,7 @@ st.markdown(f"""
 
 left, right = st.columns([2, 5])
 with left:
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     if c1.button("− 30 min", use_container_width=True):
         st.session_state.now = max(0, now - 30)
         st.rerun()
@@ -292,6 +335,7 @@ with left:
     if c3.button("Restart", use_container_width=True):
         st.session_state.now = 10 * 60
         st.rerun()
+    c4.button("Sign out", on_click=sign_out, use_container_width=True)
 with right, st.container(key="tabs"):
     st.radio("Tab", ["Today", "Flights", "Flight detail", "Warnings", "Control", "Try a flight"],
              key="tab", horizontal=True, label_visibility="collapsed", on_change=tab_changed)
