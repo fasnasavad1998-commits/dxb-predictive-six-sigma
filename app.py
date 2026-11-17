@@ -1,4 +1,5 @@
 import json
+import math
 from statistics import NormalDist
 
 import pandas as pd
@@ -36,6 +37,31 @@ RISK_BANDS = [(0.85, 0.840, 75.8, "85%+"), (0.70, 0.520, 50.7, "70–85%"),
 def band_of(p):
     return next(b for b in RISK_BANDS if p >= b[0])
 
+
+# Mid-points of the test-set bands above the cut-off: risk, avg minutes when late, share late
+_BAND_PTS = [(0.6265, 47.9, 0.321), (0.775, 50.7, 0.520), (0.925, 75.8, 0.840)]
+
+
+def band_est(p):
+    """Smooth estimate of (minutes late if late, share late) for a risk score, between band mid-points."""
+    xs = [b[0] for b in _BAND_PTS]
+    def lerp(i):
+        ys = [b[i] for b in _BAND_PTS]
+        if p <= xs[0]:
+            return ys[0]
+        if p >= xs[-1]:
+            return ys[-1]
+        for j in range(len(xs) - 1):
+            if xs[j] <= p <= xs[j + 1]:
+                t = (p - xs[j]) / (xs[j + 1] - xs[j])
+                return ys[j] + t * (ys[j + 1] - ys[j])
+    return lerp(1), lerp(2)
+
+
+def pct(p):
+    """One rounding rule everywhere: round DOWN to 1 decimal, never show 100%."""
+    return min(math.floor(p * 1000 + 1e-9) / 10, 99.9)
+
 # ---------- Colours (from the Dubai Airports site palette) ----------
 NAVY = "#2C2D65"      # header, Send, primary buttons
 PURPLE = "#554CAA"    # links, on-time bars, Open flight
@@ -67,7 +93,7 @@ def load_data():
     df["act_min"] = (actual - day_start).dt.total_seconds() / 60
     df["eta_txt"] = sched.dt.strftime("%H:%M")
     df["act_txt"] = actual.dt.strftime("%H:%M")
-    df["risk_pct"] = (df["p_xgb"] * 100).astype(int)          # round down, so 69.5% shows as 69 (medium), not 70
+    df["risk_pct"] = df["p_xgb"].apply(pct)                    # round down to 1 decimal, max 99.9
     df["high"] = df["p_xgb"] >= CUTOFF
     for reason in rules["reason"].unique():
         drivers = rules.loc[rules["reason"] == reason, "driver"]
@@ -142,6 +168,11 @@ def send_warning(fx, flight_no):
         record(fx, flight_no, "Sent")
 
 
+def when_txt(m):
+    """Minutes to the scheduled time, without negative numbers."""
+    return f"in {int(m)} min" if m >= 0 else f"{int(-m)} min past schedule"
+
+
 def plural(n, word):
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
@@ -171,12 +202,17 @@ to_come = flights[~flights["landed"]]
 
 
 def copq_today():
-    """Cost so far today and estimated saving from fixes done (landed late flights only)."""
+    """Cost so far today, plus the saving from fixes done:
+    expected = counted when the fix is marked done (chance the flight is late x minutes saved),
+    confirmed = only flights that have landed and really were late."""
+    rate, sm = aed_per_min(), st.session_state.save_min
     late_landed = flights[flights["landed"] & (flights["delayed_15"] == 1)]
-    cost = late_landed["arr_delay_min"].sum() * aed_per_min()
+    cost = late_landed["arr_delay_min"].sum() * rate
     helped = late_landed[late_landed["any_done"]]
-    saved_min = helped["arr_delay_min"].clip(upper=st.session_state.save_min).sum()
-    return cost, saved_min * aed_per_min(), len(helped)
+    confirmed = helped["arr_delay_min"].clip(upper=sm).sum() * rate
+    done = flights[flights["any_done"]]
+    expected = sum(band_est(p)[1] for p in done["p_xgb"]) * sm * rate
+    return {"cost": cost, "expected": expected, "n_done": len(done), "confirmed": confirmed, "n_confirmed": len(helped)}
 
 SHOW_COLS = {"flightnumber": "Flight", "origin_iata": "From", "eta_txt": "ETA",
              "risk_pct": "Risk %", "main_reason": "Main reason", "fix_status": "Fix status"}
@@ -194,7 +230,7 @@ def style_table(t):
     return (t.style.map(lambda v: f"color:{NAVY};font-weight:700;text-decoration:underline", subset=["Flight"])
              .map(risk_style, subset=["Risk %"])
              .map(lambda v: status_colour.get(v, ""), subset=["Fix status"])
-             .format({"Risk %": lambda v: ("● " if v >= CUTOFF * 100 else "○ ") + f"{v}%"}))
+             .format({"Risk %": lambda v: ("● " if v >= CUTOFF * 100 else "○ ") + f"{v:.1f}%"}))
 
 
 # ---------- Card rows (like the DXB flight list) ----------
@@ -220,7 +256,7 @@ def risk_block(p, title, size=52):
     band = {"hi": "High risk", "md": "Medium risk", "lo": "Low risk"}[kind]
     return (f"<div style='font-size:13px;color:{PURPLE};margin-bottom:8px'>{title}</div>"
             f"<div style='display:inline-block;background:{bg};color:{fg};border-radius:14px;padding:2px 18px;"
-            f"font-size:{size}px;font-weight:700;line-height:1.2'>{p * 100:.1f}%</div>"
+            f"font-size:{size}px;font-weight:700;line-height:1.2'>{pct(p):.1f}%</div>"
             f"<div style='margin-top:10px'><span style='display:inline-block;background:{bg};color:{fg};"
             f"border-radius:999px;padding:3px 14px;font-weight:700;font-size:14px'>{band}</span></div>")
 
@@ -241,7 +277,7 @@ def flight_rows(df, prefix):
             c[0].markdown(f"**{r['flightnumber']}**")
             c[1].markdown(r["origin_iata"])
             c[2].markdown(r["eta_txt"])
-            c[3].markdown(bubble(f"{r['risk_pct']}%", risk_kind(r["p_xgb"])), unsafe_allow_html=True)
+            c[3].markdown(bubble(f"{r['risk_pct']:.1f}%", risk_kind(r["p_xgb"])), unsafe_allow_html=True)
             c[4].markdown(r["main_reason"])
             c[5].markdown(bubble(r["fix_status"], STATUS_KIND[r["fix_status"]]), unsafe_allow_html=True)
             c[6].button("→", key=f"arrow_{prefix}_{idx}", on_click=open_flight_idx, args=(idx,),
@@ -396,18 +432,19 @@ if tab == "Today":
     sigma = f"{NormalDist().inv_cdf(1 - p_late) + 1.5:.2f} σ" if 0 < p_late < 1 else "n/a"
     need_action = to_come[to_come["high"] & (to_come["mins_to"] <= 60)]
 
-    cost_today, saved_today, n_helped = copq_today()
+    cq = copq_today()
     k1, k2, k3, k4, k5 = st.columns([1, 1, 1, 1, 1.3])
     with k5.container(border=True, key=card_key()):
-        st.metric("Est. airport delay cost today", aed(cost_today))
-        st.caption(f"Landed delay minutes × {aed_per_min():.0f} AED/min · "
-                   f"saved by fixes done: **{aed(saved_today)}** ({plural(n_helped, 'flight')})")
+        st.metric("Est. airport delay cost today", aed(cq["cost"]))
+        st.caption(f"Landed delay minutes × {aed_per_min():.0f} AED/min · fixes done: "
+                   f"**{aed(cq['expected'])}** expected saving ({plural(cq['n_done'], 'flight')}), "
+                   f"{aed(cq['confirmed'])} confirmed")
     with k1.container(border=True, key=card_key()):
         st.metric("Flights today", len(flights))
         st.caption(f"{len(landed)} landed · {len(to_come)} still to come")
     with k2.container(border=True, key=card_key()):
         st.metric("High risk, still to come", int(to_come["high"].sum()))
-        st.caption(f"Risk score at or above {CUTOFF:.0%}")
+        st.caption(f"Risk score at or above {CUTOFF:.1%}")
     with k3.container(border=True, key=card_key()):
         st.metric("Need action now", len(need_action))
         st.caption("High risk, lands within 60 min")
@@ -432,7 +469,7 @@ if tab == "Today":
         st.caption("High-risk flights still to come, by main reason")
         top = to_come.loc[to_come["high"], "main_reason"].value_counts()
         fig2 = go.Figure(go.Bar(x=top.values[::-1], y=top.index[::-1], orientation="h", marker_color=RED))
-        fig2.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10))
+        fig2.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10), yaxis=dict(ticksuffix="   "))
         st.plotly_chart(fig2, use_container_width=True, theme=None)
 
     h1, h2 = st.columns([4, 1], vertical_alignment="center")
@@ -487,7 +524,8 @@ elif tab == "Flights":
 # ---------- FLIGHT DETAIL ----------
 elif tab == "Flight detail":
     hi_up = to_come[to_come["high"]]
-    n_actioned = int(hi_up["actioned"].sum())
+    n_pending = int((~hi_up["actioned"]).sum())
+    n_actioned = int(flights.loc[flights["high"], "actioned"].sum())      # whole day so far, landed or not
 
     if st.session_state.sel is None:
         pending = hi_up[~hi_up["actioned"]].sort_values("p_xgb", ascending=False)
@@ -498,11 +536,11 @@ elif tab == "Flight detail":
 
     t1, t2, t3 = st.columns([2, 2, 1])
     with t1.container(border=True, key=card_key()):
-        st.metric("Pending action", plural(len(hi_up) - n_actioned, "flight"))
-        st.caption("High risk, a fix not in place and no warning sent")
+        st.metric("Pending action", plural(n_pending, "flight"))
+        st.caption("High risk, still to come, a fix not in place and no warning sent")
     with t2.container(border=True, key=card_key()):
         st.metric("Actioned", plural(n_actioned, "flight"))
-        st.caption("Every fix in place or warned")
+        st.caption("Today so far (landed or not): every fix in place or warned")
     t3.button("Back to flight list", on_click=go_to, args=("Flights",), use_container_width=True)
 
     if st.session_state.auto:
@@ -512,7 +550,7 @@ elif tab == "Flight detail":
     a1, a2 = st.columns([3, 1])
     with a1.container(border=True, key=card_key()):
         st.markdown(f"#### {f['flightnumber']} from {f['originname']} ({f['origin_iata']})")
-        when = f"landed {f['act_txt']}" if f["landed"] else f"in {int(f['mins_to'])} min"
+        when = f"landed {f['act_txt']}" if f["landed"] else when_txt(f["mins_to"])
         st.write(f"{f['airlinename']} · aircraft {f['aircraft_iata']} ({f['aircraftregistration']}) · "
                  f"terminal {f['aircraftterminal']} · scheduled {f['eta_txt']} ({when})")
         if f["landed"]:
@@ -531,8 +569,10 @@ elif tab == "Flight detail":
         vals = vals.reindex(vals.abs().sort_values(ascending=False).index)[:6][::-1]
         fig = go.Figure(go.Bar(x=vals.values, y=vals.index, orientation="h",
                                marker_color=[RED if v > 0 else MUTED for v in vals.values]))
-        fig.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="SHAP (log-odds)")
+        fig.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="SHAP (log-odds)",
+                          yaxis=dict(ticksuffix="   "))
         st.plotly_chart(fig, use_container_width=True, theme=None)
+        st.caption("Time of year / day = season + day of week · Weather = wind, visibility, fog, storm and temperature")
     with b2.container(border=True, key=card_key()):
         st.markdown("**Key facts**")
         st.write(f"Inbound plane departure delay: **{f['knockon_dep_delay_min']:.0f} min**")
@@ -589,7 +629,7 @@ elif tab == "Warnings":
         st.session_state.tab = "Flight detail"
 
     def due(m):
-        return f"{int(m)} min to go" if m >= 0 else f"{int(-m)} min overdue"
+        return f"{int(m)} min to go" if m >= 0 else f"{int(-m)} min past schedule"
 
     sent_at = {}
     for e in st.session_state.log:
@@ -605,18 +645,23 @@ elif tab == "Warnings":
                 continue
             if row["mins_to"] > WINDOW and not status:
                 continue
-            status = status or "New"
-            if status == "Sent" and now - sent_at.get(fx["code"], now) > OVERDUE:
-                status = "Overdue"
-            items.append({"idx": idx, "row": row, "fx": fx, "status": status})
+            base = status or "New"
+            late_open = base in ("New", "Sent") and row["mins_to"] < 0          # still open after the scheduled time
+            slow_ack = base == "Sent" and now - sent_at.get(fx["code"], now) > OVERDUE
+            shown = "Overdue" if (late_open or slow_ack) else base
+            items.append({"idx": idx, "row": row, "fx": fx, "status": shown, "base": base})
 
     counts = pd.Series([i["status"] for i in items], dtype=str).value_counts()
-    k = st.columns(4)
+    k = st.columns(5)
     for col, name in zip(k, ["New", "Sent", "Acknowledged", "Overdue"]):
         with col.container(border=True, key=card_key()):
             st.metric(name, int(counts.get(name, 0)))
+    with k[4].container(border=True, key=card_key()):
+        st.metric("Fix done", sum(1 for v in st.session_state.done.values() if v))
+        st.caption("Closed today")
     st.caption(f"A warning opens when a flight is high risk, a fix is not in place and it lands within {WINDOW} min. "
-               f"Overdue = sent but not acknowledged within {OVERDUE} min. Mark fix done closes it.")
+               f"Overdue = still open after the flight's scheduled time, or sent but not acknowledged within "
+               f"{OVERDUE} min. Mark fix done closes it.")
 
     w1, w2 = st.columns([4, 1])
     w1.markdown("**Open warnings by owner**")
@@ -643,10 +688,10 @@ elif tab == "Warnings":
                     st.write(fx["fix"])
                     st.write(f"Status: **{i['status']}**")
                     b1, b2 = st.columns(2)
-                    if i["status"] == "New" and b1.button("Send", key="send_" + fx["key"], use_container_width=True):
+                    if i["base"] == "New" and b1.button("Send", key="send_" + fx["key"], use_container_width=True):
                         send_warning(fx, row["flightnumber"])
                         st.rerun()
-                    if i["status"] in ("Sent", "Overdue") and b1.button("Acknowledge", key="ack_" + fx["key"],
+                    if i["base"] == "Sent" and b1.button("Acknowledge", key="ack_" + fx["key"],
                                                                         use_container_width=True):
                         st.session_state.warn[fx["key"]] = "Acknowledged"
                         record(fx, row["flightnumber"], "Acknowledged")
@@ -764,7 +809,7 @@ elif tab == "Control":
     st.markdown("### :material/payments: Cost of poor quality (COPQ)")
     rate = aed_per_min()
     year_min = DELAY_MIN_DATA * 365 / DATA_DAYS
-    cost_today, saved_today, n_helped = copq_today()
+    cq = copq_today()
     q1, q2, q3 = st.columns(3)
     with q1.container(border=True, key=card_key()):
         st.metric("Delay minutes a year", f"{year_min / 1e6:.2f} M")
@@ -773,7 +818,7 @@ elif tab == "Control":
         st.metric("Airport COPQ a year (estimate)", aed(year_min * rate))
         st.caption(f"{year_min / 1e6:.2f} M min × {rate:.1f} AED/min")
     with q3.container(border=True, key=card_key()):
-        st.metric("Cost so far today", aed(cost_today))
+        st.metric("Cost so far today", aed(cq["cost"]))
         st.caption("Landed late flights on 3 Jan")
 
     b1, b2 = st.columns([3, 2])
@@ -810,14 +855,17 @@ elif tab == "Control":
         st.radio("Minutes saved per fix done", [5, 10, 15], horizontal=True, key="save_w",
                  index=[5, 10, 15].index(st.session_state.save_min), on_change=keep_save)
         sm = st.session_state.save_min
-        cost_today, saved_today, n_helped = copq_today()
+        cq = copq_today()
         late_year = LATE_FLIGHTS_DATA * 365 / DATA_DAYS
         s1, s2 = st.columns(2)
-        s1.metric("3 Jan replay (so far)", aed(saved_today))
-        s1.caption(f"{plural(n_helped, 'late flight')} with a fix done × {sm} min × {rate:.0f} AED")
+        s1.metric("3 Jan replay: fixes done (expected)", aed(cq["expected"]))
+        s1.caption(f"{plural(cq['n_done'], 'flight')} with a fix done × chance it is late (its risk band) × {sm} min × "
+                   f"{rate:.0f} AED · confirmed so far (landed late): **{aed(cq['confirmed'])}** "
+                   f"({plural(cq['n_confirmed'], 'flight')})")
         s2.metric("Full year", aed(late_year * CATCH_RATE * sm * rate))
         s2.caption(f"Late flights caught ({CATCH_RATE:.0%}) × {sm} min × {rate:.0f} AED")
-        st.caption("Simulated: these flights really landed late. This shows what acting on warnings could save.")
+        st.caption("Simulated: minutes saved per fix is a setting, not a measured result. "
+                   "Expected counts as soon as a fix is marked done; confirmed counts once the flight lands late.")
 
     st.caption("Illustrative estimate. Method inspired by the EUROCONTROL / University of Westminster airline "
                "delay-cost study. Stand cost from DXB published parking charges; other items are assumptions.")
@@ -861,19 +909,23 @@ elif tab == "Try a flight":
         knock = a.number_input("Inbound delay (min)", 0, 600, value=None, placeholder="unknown",
                                help="How late the inbound plane left its last airport. Leave empty if unknown.")
         knock_known = knock is not None
-        rot = b.number_input("Hours since left DXB", 0.0, 72.0, 0.0, 0.5, help="0 = unknown")
+        rot = b.number_input("Hours since left DXB", 0.0, 50.0, 0.0, 0.5,
+                             help="0 = unknown. Training data range: 0.25 to 50 hours.")
         season = c.selectbox("Season", cats["season"],
                              index=cats["season"].index("off_peak") if "off_peak" in cats["season"] else 0)
         route_default = lk["route_rate"].get(origin, lk["avg_late_rate"]) * 100
         route = a.number_input("Route late 7d (%)", 0.0, 100.0, float(round(route_default, 1)))
-        arrivals = b.number_input("Arrivals that hour", 0, 80, int(lk["hourly_arrivals"].get(str(sched.hour), 30)))
+        arr_default = min(39, max(6, int(lk["hourly_arrivals"].get(str(sched.hour), 30))))
+        arrivals = b.number_input("Arrivals that hour", 6, 39, arr_default,
+                                  help="DXB had 6 to 39 arrivals an hour in the training data. "
+                                       "The model treats anything above 39 the same as 39.")
         codeshare = c.checkbox("Codeshare")
         stopover = c.checkbox("Stopover")
         st.caption("WEATHER")
         a, b, c = st.columns(3)
-        wind = a.number_input("Wind (kt)", 0, 80, 10)
-        vis = b.number_input("Visibility (km)", 0.0, 10.0, 10.0, 0.5)
-        temp = c.number_input("Temp (°C)", 0, 50, 25)
+        wind = a.number_input("Wind (kt)", 2, 22, 10, help="Training data range: 2 to 22 kt.")
+        vis = b.number_input("Visibility (km)", 0.5, 10.0, 10.0, 0.5, help="Training data range: 0.4 to 10 km.")
+        temp = c.number_input("Temp (°C)", 14, 46, 25, help="Training data range: 14 to 46 °C.")
         fog = a.checkbox("Fog or dust")
         storm = b.checkbox("Storm or rain")
 
@@ -929,8 +981,10 @@ elif tab == "Try a flight":
                 v = vals.reindex(vals.abs().sort_values(ascending=False).index)[:6][::-1]
                 fig = go.Figure(go.Bar(x=v.values, y=v.index, orientation="h",
                                        marker_color=[RED if x > 0 else MUTED for x in v.values]))
-                fig.update_layout(height=230, margin=dict(l=10, r=10, t=5, b=10), xaxis_title="SHAP (log-odds)")
+                fig.update_layout(height=230, margin=dict(l=10, r=10, t=5, b=10), xaxis_title="SHAP (log-odds)",
+                                  yaxis=dict(ticksuffix="   "))
                 st.plotly_chart(fig, use_container_width=True, theme=None)
+                st.caption("Time of year / day = season + day of week · Weather = wind, visibility, fog, storm and temperature")
 
             with st.container(border=True, key=card_key()):
                 action = (rules[rules["actionable"] == 1].drop_duplicates("reason")
@@ -973,13 +1027,13 @@ elif tab == "Try a flight":
                     elif st.session_state.get("try_cost"):
                         rate = aed_per_min()
                         sm = st.session_state.save_min
-                        _, share, mins, name = band_of(risk)
+                        mins, share = band_est(risk)
                         x1, x2 = st.columns(2)
                         x1.metric("Airport cost if this flight is late", aed(mins * rate))
-                        x1.caption(f"Flights scoring {name} were {mins:.0f} min late on average "
-                                   f"(test data) × {rate:.0f} AED/min · {share:.0%} of them were late")
-                        x2.metric("Est. saved by the warnings sent", aed(sm * rate))
-                        x2.caption(f"{sm} min saved × {rate:.0f} AED/min")
+                        x1.caption(f"Flights scoring around {pct(risk):.0f}% were about {mins:.0f} min late on average "
+                                   f"(test data) × {rate:.0f} AED/min")
+                        x2.metric("Est. saved by the warnings sent", aed(share * sm * rate))
+                        x2.caption(f"{share:.0%} chance it is late (test data) × {sm} min saved × {rate:.0f} AED/min")
                         st.caption("Illustrative estimate, same AED/min as the Control tab. Not added to Control totals.")
 
 st.caption("Student prototype (BUS922). Not affiliated with or endorsed by Dubai Airports. Open data from Dubai Pulse.")
